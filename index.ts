@@ -2,8 +2,9 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { Plugin } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
+import { readRuleLoadingFlags } from "./src/env";
 import { RuleLoader } from "./src/loader";
-import { formatSystemPromptSection, selectRules } from "./src/matcher";
+import { filterRulesForSession, formatSystemPromptSection, selectRules } from "./src/matcher";
 import { createProjectRule, createUserRule, listRules } from "./src/tools";
 import type { SessionState } from "./src/types";
 import { createV2Setup } from "./src/v2";
@@ -36,6 +37,9 @@ export const CursorRulesPlugin: Plugin = async ({ directory, worktree, client })
   const projectRulesDir = join(projectRoot, ".opencode", "rules");
   const legacyFilePath = join(projectRoot, ".cursorrules");
 
+  // Opt-in loading flags (default off: nothing loads before an explicit init)
+  const { loadAlwaysOnStartup, loadMentionWithoutInit } = readRuleLoadingFlags();
+
   // Log startup info
   await client.app.log({
     body: {
@@ -46,6 +50,8 @@ export const CursorRulesPlugin: Plugin = async ({ directory, worktree, client })
         projectRulesDir,
         userRulesDir,
         legacyFilePath,
+        loadAlwaysOnStartup,
+        loadMentionWithoutInit,
       },
     },
   });
@@ -105,7 +111,7 @@ export const CursorRulesPlugin: Plugin = async ({ directory, worktree, client })
     const id = sessionID || "__default__";
     let state = sessions.get(id);
     if (!state) {
-      state = { filePaths: new Set(), lastUserMessage: "" };
+      state = { filePaths: new Set<string>(), lastUserMessage: "", explicitlyEnabled: false };
       sessions.set(id, state);
 
       // Cap sessions to prevent memory leak (LRU eviction)
@@ -185,8 +191,26 @@ export const CursorRulesPlugin: Plugin = async ({ directory, worktree, client })
         return;
       }
 
+      // Gate rules that are not allowed before an explicit session init
+      const effectiveRules = filterRulesForSession(rules, {
+        explicitlyEnabled: session.explicitlyEnabled,
+        loadAlwaysOnStartup,
+        loadMentionWithoutInit,
+      });
+
+      if (effectiveRules.length === 0) {
+        await client.app.log({
+          body: {
+            service: SERVICE_NAME,
+            level: "debug",
+            message: "All rules gated before explicit session init",
+          },
+        });
+        return;
+      }
+
       // Select which rules to inject/suggest/list
-      const { injected, suggested, available } = selectRules(rules, session);
+      const { injected, suggested, available } = selectRules(effectiveRules, session);
 
       await client.app.log({
         body: {
@@ -255,6 +279,12 @@ Use the create_project_rule tool to create the rule file at the project level (.
 - Description
 
 Use the list_rules tool to retrieve and display this information.`,
+      };
+
+      // Command to explicitly init rule loading for this session
+      config.command["use-cursor-rule"] = {
+        description: "Load cursor rules for this session and follow them from now on",
+        template: `Use the list_rules tool to load all configured cursor rules, then follow them for the rest of this session. After loading, briefly confirm which rules are active.`,
       };
     },
 
@@ -392,12 +422,16 @@ Use the list_rules tool to retrieve and display this information.`,
       list_rules: tool({
         description: "List all currently loaded cursor rules with their loading strategies",
         args: {},
-        execute: async () => {
+        execute: async (_input, ctx) => {
+          // Calling list_rules is an explicit init: unlock rule loading for this session
+          const session = getSession(ctx?.sessionID);
+          session.explicitlyEnabled = true;
           await client.app.log({
             body: {
               service: SERVICE_NAME,
               level: "info",
-              message: "Listing all cursor rules",
+              message: "Session explicitly initialized via list_rules",
+              extra: { sessionID: ctx?.sessionID ?? "__default__" },
             },
           });
 

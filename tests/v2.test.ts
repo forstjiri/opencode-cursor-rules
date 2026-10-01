@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import pluginDefault, { CursorRulesPlugin } from "../index";
@@ -11,10 +11,13 @@ import type { V2Context, V2Registration, V2SessionContextEvent } from "../src/v2
  */
 function createMockContext() {
   const contextHooks: Array<(event: V2SessionContextEvent) => Promise<void>> = [];
-  const toolBeforeHooks: Array<(event: { tool: string; sessionID: string; id: string; input: unknown }) => Promise<void>> = [];
+  const toolBeforeHooks: Array<
+    (event: { tool: string; sessionID: string; id: string; input: unknown }) => Promise<void>
+  > = [];
   const tools: Array<Record<string, unknown>> = [];
   const commands: Map<string, Record<string, unknown>> = new Map();
   const reg = (): V2Registration => ({ dispose: async () => {} });
+  const promptCalls: Array<Record<string, unknown>> = [];
 
   const ctx = {
     app: { name: "opencode", version: "test" },
@@ -32,6 +35,7 @@ function createMockContext() {
     command: {
       transform: async (
         cb: (draft: {
+          add: (c: Record<string, unknown>) => void;
           list: () => Array<Record<string, unknown>>;
           get: (n: string) => Record<string, unknown> | undefined;
           update: (n: string, fn: (c: Record<string, unknown>) => void) => void;
@@ -39,6 +43,7 @@ function createMockContext() {
         }) => void,
       ) => {
         cb({
+          add: (c) => commands.set(String(c.name), c),
           list: () => [...commands.values()],
           get: (n) => commands.get(n),
           update: (n, fn) => {
@@ -57,13 +62,34 @@ function createMockContext() {
         if (name === "context") contextHooks.push(cb);
         return reg();
       },
+      prompt: async (input: Record<string, unknown>) => {
+        promptCalls.push(input);
+        return {};
+      },
     },
     event: {
       subscribe: async function* () {},
     },
   } as unknown as V2Context;
 
-  return { ctx, contextHooks, toolBeforeHooks, tools, commands };
+  return { ctx, contextHooks, toolBeforeHooks, tools, commands, promptCalls };
+}
+
+function buildContextEvent(sessionID: string): V2SessionContextEvent {
+  return {
+    sessionID,
+    agent: "build",
+    model: {},
+    system: [{ type: "text", text: "You are a coder." }],
+    messages: [
+      {
+        id: "msg-1",
+        role: "user",
+        content: [{ type: "text", text: "hello world" }],
+      },
+    ],
+    tools: {},
+  };
 }
 
 describe("v2 plugin export", () => {
@@ -81,7 +107,8 @@ describe("v2 plugin export", () => {
   });
 
   test("setup no-ops silently on v1-style context (no tool/session surfaces)", async () => {
-    const setup = (pluginDefault as { setup: (ctx: unknown) => Promise<() => Promise<void>> }).setup;
+    const setup = (pluginDefault as { setup: (ctx: unknown) => Promise<() => Promise<void>> })
+      .setup;
     const v1StyleCtx = {
       options: {},
       agent: { transform: async () => ({ dispose: async () => {} }), reload: async () => {} },
@@ -94,7 +121,8 @@ describe("v2 plugin export", () => {
   });
 
   test("setup no-ops safely with undefined context", async () => {
-    const setup = (pluginDefault as { setup: (ctx: unknown) => Promise<() => Promise<void>> }).setup;
+    const setup = (pluginDefault as { setup: (ctx: unknown) => Promise<() => Promise<void>> })
+      .setup;
     const cleanup = await setup(undefined);
     expect(typeof cleanup).toBe("function");
     await cleanup();
@@ -110,6 +138,10 @@ describe("v2 setup", () => {
     originalCwd = process.cwd();
     process.chdir(tempDir);
 
+    // Default gating: nothing loads before an explicit init
+    delete process.env.LOAD_ALWAYS_APPLY_RULES_ON_STARTUP;
+    delete process.env.LOAD_MENTION_RULES_WITHOUT_EXPLICIT_INIT;
+
     // Project rule: always applied
     mkdirSync(join(tempDir, ".opencode", "rules"), { recursive: true });
     writeFileSync(
@@ -121,18 +153,27 @@ describe("v2 setup", () => {
   afterEach(() => {
     process.chdir(originalCwd);
     rmSync(tempDir, { recursive: true, force: true });
+    delete process.env.LOAD_ALWAYS_APPLY_RULES_ON_STARTUP;
+    delete process.env.LOAD_MENTION_RULES_WITHOUT_EXPLICIT_INIT;
   });
 
   test("setup registers commands, tools, and session context hook", async () => {
     const mock = createMockContext();
-    const setup = (pluginDefault as { setup: (ctx: V2Context) => Promise<() => Promise<void>> }).setup;
+    const setup = (pluginDefault as { setup: (ctx: V2Context) => Promise<() => Promise<void>> })
+      .setup;
     const cleanup = await setup(mock.ctx);
 
     expect(mock.commands.has("list-rules")).toBe(true);
     expect(mock.commands.has("create-user-rule")).toBe(true);
     expect(mock.commands.has("create-project-rule")).toBe(true);
-    const listRules = mock.commands.get("list-rules");
-    expect(typeof listRules?.template).toBe("string");
+    expect(mock.commands.has("use-cursor-rule")).toBe(true);
+    for (const command of mock.commands.values()) {
+      expect(command.name).toBeDefined();
+      // v2 commands carry execute() (or a template on legacy update() hosts)
+      expect(typeof command.execute === "function" || typeof command.template === "string").toBe(
+        true,
+      );
+    }
 
     const toolNames = mock.tools.map((t) => t.name);
     expect(toolNames).toContain("list_rules");
@@ -149,42 +190,98 @@ describe("v2 setup", () => {
     await cleanup();
   });
 
-  test("session context hook injects always-apply project rule into system prompt", async () => {
+  test("session context hook gates always-apply rule before explicit init", async () => {
     const mock = createMockContext();
-    const setup = (pluginDefault as { setup: (ctx: V2Context) => Promise<() => Promise<void>> }).setup;
+    const setup = (pluginDefault as { setup: (ctx: V2Context) => Promise<() => Promise<void>> })
+      .setup;
     const cleanup = await setup(mock.ctx);
 
-    const event: V2SessionContextEvent = {
-      sessionID: "ses-v2-test",
-      agent: "build",
-      model: {},
-      system: [{ type: "text", text: "You are a coder." }],
-      messages: [
-        {
-          id: "msg-1",
-          role: "user",
-          content: [{ type: "text", text: "hello world" }],
-        },
-      ],
-      tools: {},
-    };
+    const event = buildContextEvent("ses-v2-gated");
+    const contextHook = mock.contextHooks[0];
+    if (!contextHook) throw new Error("context hook not registered");
+    await contextHook(event);
+
+    // Default flags (0/0): nothing is injected before an explicit init
+    expect(event.system.length).toBe(1);
+
+    await cleanup();
+  });
+
+  test("LOAD_ALWAYS_APPLY_RULES_ON_STARTUP=1 injects always rule without init", async () => {
+    process.env.LOAD_ALWAYS_APPLY_RULES_ON_STARTUP = "1";
+    const mock = createMockContext();
+    const setup = (pluginDefault as { setup: (ctx: V2Context) => Promise<() => Promise<void>> })
+      .setup;
+    const cleanup = await setup(mock.ctx);
+
+    const event = buildContextEvent("ses-v2-always");
     const contextHook = mock.contextHooks[0];
     if (!contextHook) throw new Error("context hook not registered");
     await contextHook(event);
 
     expect(event.system.length).toBe(2);
-    expect(event.system[0]).toEqual({ type: "text", text: "You are a coder." });
-    const injected = event.system[1];
-    expect(injected).toBeDefined();
-    expect(injected?.text).toContain("v2-always");
-    expect(injected?.text).toContain("V2 always rule content.");
+    expect(event.system[1]?.text).toContain("V2 always rule content.");
+
+    await cleanup();
+  });
+
+  test("list_rules tool call is an explicit init and unlocks injection", async () => {
+    const mock = createMockContext();
+    const setup = (pluginDefault as { setup: (ctx: V2Context) => Promise<() => Promise<void>> })
+      .setup;
+    const cleanup = await setup(mock.ctx);
+
+    const listTool = mock.tools.find((t) => t.name === "list_rules") as unknown as {
+      execute: (input: unknown, ctx: unknown) => Promise<{ content: string }>;
+    };
+    const result = await listTool.execute({}, { sessionID: "ses-v2-init" });
+    expect(result.content).toContain("v2-always");
+
+    const event = buildContextEvent("ses-v2-init");
+    const contextHook = mock.contextHooks[0];
+    if (!contextHook) throw new Error("context hook not registered");
+    await contextHook(event);
+
+    expect(event.system.length).toBe(2);
+    expect(event.system[1]?.text).toContain("V2 always rule content.");
+
+    await cleanup();
+  });
+
+  test("use-cursor-rule command submits its template as a session prompt", async () => {
+    const mock = createMockContext();
+    const setup = (pluginDefault as { setup: (ctx: V2Context) => Promise<() => Promise<void>> })
+      .setup;
+    const cleanup = await setup(mock.ctx);
+
+    const command = mock.commands.get("use-cursor-rule") as unknown as {
+      execute: (invocation: {
+        sessionID: string;
+        prompt?: Record<string, unknown>;
+        delivery?: string;
+      }) => Promise<void>;
+    };
+    expect(typeof command.execute).toBe("function");
+    await command.execute({
+      sessionID: "ses-v2-cmd",
+      prompt: { text: "ignored" },
+      delivery: "steer",
+    });
+
+    expect(mock.promptCalls.length).toBe(1);
+    expect(mock.promptCalls[0]?.sessionID).toBe("ses-v2-cmd");
+    expect(String(mock.promptCalls[0]?.text)).toContain("list_rules");
+    expect(mock.promptCalls[0]?.delivery).toBe("steer");
 
     await cleanup();
   });
 
   test("tool execute.before hook tracks file paths for glob rules", async () => {
+    // Glob rules are "mention" class: allow them without init for this test
+    process.env.LOAD_MENTION_RULES_WITHOUT_EXPLICIT_INIT = "1";
     const mock = createMockContext();
-    const setup = (pluginDefault as { setup: (ctx: V2Context) => Promise<() => Promise<void>> }).setup;
+    const setup = (pluginDefault as { setup: (ctx: V2Context) => Promise<() => Promise<void>> })
+      .setup;
     const cleanup = await setup(mock.ctx);
 
     // Glob-based project rule
@@ -222,7 +319,8 @@ describe("v2 setup", () => {
 
   test("registered list_rules tool executes and returns rule list", async () => {
     const mock = createMockContext();
-    const setup = (pluginDefault as { setup: (ctx: V2Context) => Promise<() => Promise<void>> }).setup;
+    const setup = (pluginDefault as { setup: (ctx: V2Context) => Promise<() => Promise<void>> })
+      .setup;
     const cleanup = await setup(mock.ctx);
 
     const listTool = mock.tools.find((t) => t.name === "list_rules") as unknown as {

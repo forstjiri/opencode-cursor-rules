@@ -55,6 +55,7 @@ export interface V2ToolDraft {
 }
 
 export interface V2CommandDraft {
+  add(command: Record<string, unknown>): void;
   list(): Array<Record<string, unknown>>;
   get(name: string): Record<string, unknown> | undefined;
   update(name: string, update: (command: Record<string, unknown>) => void): void;
@@ -89,6 +90,7 @@ export interface V2Context {
       name: "context",
       cb: (event: V2SessionContextEvent) => Promise<void>,
     ): Promise<V2Registration>;
+    prompt(input: Record<string, unknown>): Promise<unknown>;
   };
   event: { subscribe(): AsyncIterable<Record<string, unknown>> };
 }
@@ -266,17 +268,46 @@ export function createV2Setup(factory: Plugin): (ctx: V2Context) => Promise<V2Cl
         const reg = await ctx.command.transform((draft) => {
           for (const [name, cmd] of Object.entries(synthCommands ?? {})) {
             try {
-              draft.update(name, (c) => {
-                c.name = name;
-                if (typeof cmd.template === "string") c.template = cmd.template;
-                if (typeof cmd.description === "string") c.description = cmd.description;
-              });
+              // v2 commands need an execute() that submits the template as a
+              // prompt; draft.update() only edits existing commands.
+              const template = typeof cmd.template === "string" ? cmd.template : "";
+              const definition = {
+                name,
+                description: typeof cmd.description === "string" ? cmd.description : name,
+                execute: async (invocation: {
+                  sessionID: string;
+                  prompt?: Record<string, unknown>;
+                  delivery?: string;
+                }) => {
+                  try {
+                    await ctx.session.prompt({
+                      ...(invocation.prompt ?? {}),
+                      sessionID: invocation.sessionID,
+                      text: template,
+                      ...(invocation.delivery ? { delivery: invocation.delivery } : {}),
+                    });
+                  } catch (err) {
+                    log("command execute failed", { name, err: String(err) });
+                  }
+                },
+              };
+              if (typeof draft.add === "function") {
+                draft.add(definition);
+              } else {
+                // Legacy host without add(): fall back to update()
+                draft.update(name, (c) => {
+                  c.name = name;
+                  if (typeof cmd.template === "string") c.template = cmd.template;
+                  if (typeof cmd.description === "string") c.description = cmd.description;
+                });
+              }
             } catch (err) {
               log("command adapt failed", { name, err: String(err) });
             }
           }
         });
         disposers.push(() => reg.dispose());
+        log("commands registered", { names: Object.keys(synthCommands ?? {}) });
       } catch (err) {
         log("command.transform failed", String(err));
       }

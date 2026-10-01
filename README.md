@@ -87,6 +87,23 @@ This gets injected into the AI's system prompt.
 | **Agent-Requested** | `description` only (no globs) | Description listed; AI decides if relevant |
 | **Manual** | No frontmatter | Only injected when user types `@rule-name` |
 
+### Opt-In Loading (OpenCode v2)
+
+By default (v2 adapter), **nothing is injected into the system prompt until the
+session is explicitly initialized** — via the `list_rules` tool or the
+`/use-cursor-rule` command. After the init, every mode above works as usual for
+that session.
+
+Two environment flags relax the gating (accept `1` or `true`):
+
+| Flag | Effect when enabled |
+|------|---------------------|
+| `LOAD_ALWAYS_APPLY_RULES_ON_STARTUP` | `alwaysApply: true` rules inject from session start, no init needed |
+| `LOAD_MENTION_RULES_WITHOUT_EXPLICIT_INIT` | Glob / description / `@rule-name` rules work from session start, no init needed |
+
+Both flags off (default) = full opt-in: run `/use-cursor-rule` (or ask the agent
+to call `list_rules`) to unlock rule loading for the current session.
+
 ### Examples
 
 **Always-apply rule:**
@@ -170,7 +187,9 @@ Create a new project-level rule in `.opencode/rules/`. Same parameters plus opti
 
 ### `list_rules`
 
-List all loaded rules with metadata, sources, and application modes.
+List all loaded rules with metadata, sources, and application modes. Calling
+this tool also counts as an explicit session init (see
+[Opt-In Loading](#opt-in-loading-opencode-v2)).
 
 ## Available Scripts
 
