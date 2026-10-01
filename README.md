@@ -55,6 +55,23 @@ Create `.mdc` files in the directory (see Rule Format below).
 
 Rules load on plugin initialization. Start a new session after adding/changing rules.
 
+- **OpenCode 1.x**: restart the CLI to reload plugins.
+- **OpenCode 2.x**: plugin files are watched and hot-reloaded by the shared
+  server; if a change does not apply, run `opencode service restart`.
+
+## Compatibility
+
+The plugin supports both host generations from a single codebase:
+
+| Host | Entry point | Notes |
+|------|-------------|-------|
+| OpenCode 1.x | `server` export | v1 hooks (`chat.message`, `experimental.chat.system.transform`, `tool.execute.before`, `config` commands) run natively |
+| OpenCode 2.x | `setup` export | v1 hooks are bridged into v2 registrations (`tool.transform`, `session.hook("context")`, `command.transform`) |
+
+All features — rule loading, glob matching, `@rule-name` mentions, management
+tools, slash commands, and the [opt-in loading](#opt-in-loading-opencode-v2)
+flags — work identically on both hosts.
+
 ## Rule Format
 
 Rules use **MDC format** (Markdown + YAML frontmatter), identical to Cursor:
