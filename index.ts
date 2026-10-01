@@ -6,6 +6,7 @@ import { RuleLoader } from "./src/loader";
 import { formatSystemPromptSection, selectRules } from "./src/matcher";
 import { createProjectRule, createUserRule, listRules } from "./src/tools";
 import type { SessionState } from "./src/types";
+import { createV2Setup } from "./src/v2";
 
 const SERVICE_NAME = "cursor-rules";
 
@@ -23,7 +24,7 @@ const SERVICE_NAME = "cursor-rules";
  * - Agent-requested via description
  * - Manual via @rule-name mention
  */
-const CursorRulesPlugin: Plugin = async ({ directory, worktree, client }) => {
+export const CursorRulesPlugin: Plugin = async ({ directory, worktree, client }) => {
   const loader = new RuleLoader();
   const sessions = new Map<string, SessionState>();
 
@@ -512,4 +513,8 @@ function formatRuleEntry(rule: {
   return parts.join("\n");
 }
 
-export default CursorRulesPlugin;
+export default {
+  id: "opencode-cursor-rules",
+  server: CursorRulesPlugin,
+  setup: createV2Setup(CursorRulesPlugin),
+};
